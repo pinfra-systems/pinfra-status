@@ -119,9 +119,13 @@ const BANNER = {
   down: { text: 'Partial Outage',          color: '#f08a8a', ink: '#2a0f0f' },
 };
 
-export default async function handler() {
+export default async function handler(request, context) {
   const results = await Promise.all(COMPONENTS.map(async c => ({ c, r: await probe(c) })));
-  recordHistory(results).catch(() => {});
+  // The edge runtime cancels un-awaited promises once the Response is
+  // returned — waitUntil keeps the history write alive past the response.
+  // Falls back to fire-and-forget if the runtime doesn't provide context.
+  const historyWrite = recordHistory(results).catch(() => {});
+  context?.waitUntil?.(historyWrite);
   const hist = await loadHistory();
 
   const overall = results.reduce((w, { r }) => (WORSE[r.state] > WORSE[w] ? r.state : w), 'ok');
