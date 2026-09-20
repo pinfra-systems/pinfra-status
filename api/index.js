@@ -96,22 +96,21 @@ function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(
 import incidentsData from './incidents.js';
 
 function incidentsHTML() {
+  // Only days that actually had incidents, newest first, capped at the
+  // last WINDOW days — a wall of "No incidents reported." is noise.
+  const WINDOW = 30;
+  const cutoff = new Date(Date.now() - WINDOW * 864e5).toISOString().slice(0, 10);
   const byDate = {};
-  for (const inc of incidentsData) (byDate[inc.date] ??= []).push(inc);
-  const rows = [];
-  for (let i = 0; i < 14; i++) {
-    const d = new Date(Date.now() - i * 864e5);
-    const key = d.toISOString().slice(0, 10);
-    const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
-    const incs = byDate[key] || [];
-    if (!incs.length) {
-      rows.push(`<div class="day"><div class="date">${label}</div><div class="none">No incidents reported${i === 0 ? ' today' : ''}.</div></div>`);
-    } else {
-      const bodies = incs.map(inc => `<div class="inc"><div class="t">${esc(inc.title)}</div><p><b>${esc(inc.status)}</b> — ${esc(inc.body)}</p><p class="ts">${esc(inc.window)}</p></div>`).join('');
-      rows.push(`<div class="day"><div class="date">${label}</div>${bodies}</div>`);
-    }
+  for (const inc of incidentsData) if (inc.date >= cutoff) (byDate[inc.date] ??= []).push(inc);
+  const days = Object.keys(byDate).sort().reverse();
+  if (!days.length) {
+    return `<div class="day"><div class="none">No incidents reported in the last ${WINDOW} days.</div></div>`;
   }
-  return rows.join('\n');
+  return days.map(key => {
+    const label = new Date(key + 'T00:00:00Z').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+    const bodies = byDate[key].map(inc => `<div class="inc"><div class="t">${esc(inc.title)}</div><p><b>${esc(inc.status)}</b> — ${esc(inc.body)}</p><p class="ts">${esc(inc.window)}</p></div>`).join('');
+    return `<div class="day"><div class="date">${label}</div>${bodies}</div>`;
+  }).join('\n');
 }
 
 const BANNER = {
