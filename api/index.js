@@ -7,7 +7,9 @@ export const config = { runtime: 'edge' };
 const COMPONENTS = [
   { key: 'platform', name: 'Platform', desc: 'platform.pinfra.app — dashboard, publishing & API', url: 'https://platform.pinfra.app/healthz' },
   { key: 'website',  name: 'Website',  desc: 'pinfra.app — landing & guides',                    url: 'https://pinfra.app/es' },
-  { key: 'apps',     name: 'Published apps', desc: '*.pinfra.app — the apps our users ship',     url: 'https://gestion-de-comercio.pinfra.app/' },
+  // Tenant apps are heavier SSR and may pay a scale-to-zero resume on the
+  // first hit, so they get a wider degraded threshold than the platform.
+  { key: 'apps',     name: 'Published apps', desc: '*.pinfra.app — the apps our users ship',     url: 'https://gestion-de-comercio.pinfra.app/', degradedMs: 3000 },
 ];
 const DEGRADED_MS = 1500;
 const TIMEOUT_MS = 6000;
@@ -38,7 +40,7 @@ async function probe(c) {
     clearTimeout(timer);
     const ms = Date.now() - t0;
     if (!r.ok && r.status >= 500) return { state: 'down', ms };
-    if (ms >= DEGRADED_MS) return { state: 'deg', ms };
+    if (ms >= (c.degradedMs || DEGRADED_MS)) return { state: 'deg', ms };
     return { state: 'ok', ms };
   } catch { return { state: 'down', ms: Date.now() - t0 }; }
 }
