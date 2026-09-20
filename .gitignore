@@ -1,0 +1,5 @@
+.vercel/
+.env*.local
+.agents/
+skills-lock.json
+.claude/
