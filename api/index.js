@@ -291,6 +291,7 @@ body{background:var(--bg);color:var(--txt);font-family:'Inter',system-ui,sans-se
 .strip{display:flex;gap:2px;margin-top:12px;height:30px}
 .strip i{flex:1;border-radius:1.5px;background:var(--ok);min-width:2px}
 .strip i:hover{filter:brightness(1.25)}
+@media(max-width:520px){.strip{gap:1px}.strip i{min-width:1px}.comp{padding:15px 16px}.wrap{padding:28px 16px 48px}}
 .strip i.deg{background:var(--warn)}.strip i.down{background:var(--err)}.strip i.nodata{background:rgba(230,237,245,.09)}
 .striplbl{display:flex;align-items:center;gap:10px;color:var(--dim);font-size:.7rem;margin-top:8px;font-variant-numeric:tabular-nums}
 .striplbl .l{white-space:nowrap}.striplbl hr{flex:1;border:none;border-top:1px solid var(--line);margin:0}
