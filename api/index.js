@@ -3,6 +3,7 @@
 // (Vercel Marketplace KV) when configured, and renders the page.
 // Without KV env vars it still works: live checks only (fail-open).
 export const config = { runtime: 'edge' };
+import { parseServerTiming, mergeHops } from './_timing.js';
 
 const COMPONENTS = [
   { key: 'platform', name: 'Platform', desc: 'platform.pinfra.app — dashboard, publishing & API', url: 'https://platform.pinfra.app/healthz' },
@@ -41,36 +42,24 @@ async function kv(cmd) {
   } catch { return null; }
 }
 
-// Server-Timing: "wake;dur=1100, app;dur=210" -> {wake: 1100, app: 210}
-function parseServerTiming(h) {
-  const out = {};
-  if (!h) return out;
-  for (const part of h.split(',')) {
-    const [name, ...params] = part.trim().split(';');
-    const m = /dur=([\d.]+)/.exec(params.join(';'));
-    if (name && m) out[name.trim().toLowerCase()] = parseFloat(m[1]);
-  }
-  return out;
-}
-
 // One timed request that follows redirects by hand, so a Server-Timing header
 // sent on any hop (the wake happens on the first one) is not lost.
 async function timed(url, timeoutMs) {
   const t0 = Date.now();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  const timing = {};
+  const hops = [];
   try {
     let cur = url;
     for (let hop = 0; ; hop++) {
       const r = await fetch(cur, { signal: ctrl.signal, redirect: 'manual', cache: 'no-store' });
-      Object.assign(timing, parseServerTiming(r.headers.get('server-timing')));
+      hops.push(parseServerTiming(r.headers.get('server-timing')));
       r.body?.cancel().catch(() => {});
       const loc = r.headers.get('location');
       if (r.status >= 300 && r.status < 400 && loc && hop < 4) { cur = new URL(loc, cur).href; continue; }
-      return { ms: Date.now() - t0, status: r.status, timing };
+      return { ms: Date.now() - t0, status: r.status, timing: mergeHops(hops) };
     }
-  } catch { return { ms: Date.now() - t0, status: 0, timing, err: true }; }
+  } catch { return { ms: Date.now() - t0, status: 0, timing: mergeHops(hops), err: true }; }
   finally { clearTimeout(timer); }
 }
 
