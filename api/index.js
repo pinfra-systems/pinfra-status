@@ -9,7 +9,7 @@ const COMPONENTS = [
   { key: 'website',  name: 'Website',  desc: 'pinfra.app — landing & guides',                    url: 'https://pinfra.app/es' },
   // Tenant apps are heavier SSR and may pay a scale-to-zero resume on the
   // first hit, so they get a wider degraded threshold than the platform.
-  { key: 'apps',     name: 'Published apps', desc: '*.pinfra.app — the apps our users ship',     url: 'https://gestion-de-comercio.pinfra.app/', degradedMs: 3000 },
+  { key: 'apps',     name: 'Published apps', desc: '*.pinfra.app — the apps our users ship. The first visit after 15 minutes without traffic wakes the app; that response is slower and is marked as degraded.', url: 'https://gestion-de-comercio.pinfra.app/', degradedMs: 3000 },
 ];
 const DEGRADED_MS = 1500;
 const TIMEOUT_MS = 6000;
@@ -48,6 +48,15 @@ async function probe(c) {
 const WORSE = { ok: 0, deg: 1, down: 2 };
 function todayUTC() { return new Date().toISOString().slice(0, 10); }
 
+// A day is stored as {w: worst state, ok, deg, down: check counters}.
+// Older days hold only the worst-state string; normalise both shapes.
+function dayEntry(v) {
+  if (v && typeof v === 'object') return { w: v.w || 'ok', ok: v.ok | 0, deg: v.deg | 0, down: v.down | 0 };
+  const e = { w: v || null, ok: 0, deg: 0, down: 0 };
+  if (v) e[v] = 1;
+  return e;
+}
+
 async function recordHistory(results) {
   // at most one write batch per 55s, guarded by a NX key
   const gate = await kv(['SET', 'probe:gate', '1', 'NX', 'EX', '55']);
@@ -57,8 +66,10 @@ async function recordHistory(results) {
     const raw = await kv(['GET', `hist:${c.key}`]);
     let hist = {};
     try { hist = raw ? JSON.parse(raw) : {}; } catch { hist = {}; }
-    const prev = hist[day];
-    if (!prev || WORSE[r.state] > WORSE[prev]) hist[day] = r.state;
+    const e = dayEntry(hist[day]);
+    e[r.state]++;
+    if (!e.w || WORSE[r.state] > WORSE[e.w]) e.w = r.state;
+    hist[day] = e;
     // keep only the window we render
     const cutoff = new Date(Date.now() - (DAYS + 5) * 864e5).toISOString().slice(0, 10);
     for (const d of Object.keys(hist)) if (d < cutoff) delete hist[d];
@@ -76,18 +87,34 @@ async function loadHistory() {
 }
 
 function stripHTML(hist, live) {
+  // Uptime = availability: checks that were not an outage / total checks.
+  // A slow answer (deg) still counts as available; performance shows in the
+  // bars. Legacy days (worst state only, no counters) weigh as many checks
+  // as the average counted day and follow the same rule (deg up, down not).
   const day = todayUTC();
-  const cells = [];
-  let okDays = 0, knownDays = 0;
+  const cells = [], legacyUp = [];
+  let avail = 0, total = 0, countedDays = 0;
   for (let i = DAYS - 1; i >= 0; i--) {
     const d = new Date(Date.now() - i * 864e5).toISOString().slice(0, 10);
-    let s = hist[d];
+    const e = hist[d] ? dayEntry(hist[d]) : null;
+    const n = e ? e.ok + e.deg + e.down : 0;
+    let s = e && e.w;
     if (d === day) s = !s || WORSE[live] > WORSE[s] ? live : s;
-    if (s) { knownDays++; if (s === 'ok') okDays++; }
+    let tip = s ? ' · ' + s : '';
+    if (e && e.w && e.ok + e.deg + e.down > 0 && typeof hist[d] === 'object') {
+      avail += e.ok + e.deg; total += n; countedDays++;
+      tip += ` · ${e.ok + e.deg}/${n} checks available`;
+    } else if (d === day && !hist[d]) {
+      total++; if (live !== 'down') avail++; // live check not persisted yet
+    } else if (s) {
+      legacyUp.push(s !== 'down');
+    }
     const cls = s === 'deg' ? ' class="deg"' : s === 'down' ? ' class="down"' : s ? '' : ' class="nodata"';
-    cells.push(`<i${cls} title="${d}${s ? ' · ' + s : ''}"></i>`);
+    cells.push(`<i${cls} title="${d}${tip}"></i>`);
   }
-  const uptime = knownDays ? ((okDays / knownDays) * 100).toFixed(2).replace(/\.?0+$/, '') : null;
+  const w = countedDays ? Math.max(1, Math.round(total / countedDays)) : 1;
+  for (const up of legacyUp) { total += w; if (up) avail += w; }
+  const uptime = total ? ((avail / total) * 100).toFixed(2).replace(/\.?0+$/, '') : null;
   return { cells: cells.join(''), uptime };
 }
 
@@ -195,7 +222,7 @@ h2{font-family:'Space Grotesk',sans-serif;font-size:1.15rem;font-weight:650;bord
   </div>
   <h2>Past incidents</h2>
   ${incidentsHTML()}
-  <div class="footer"><span>Probed live on every visit (cached 60&nbsp;s), from Vercel's edge — outside pinfra's own infrastructure.</span><span class="out">If something is broken while this page reads green, tell us: soporte@pinfra.app</span></div>
+  <div class="footer"><span>Probed live on every visit (cached 60&nbsp;s), from Vercel's edge — outside pinfra's own infrastructure. Uptime is the share of checks that were not an outage; slow responses show as degraded in the bars.</span><span class="out">If something is broken while this page reads green, tell us: soporte@pinfra.app</span></div>
 </div></body></html>`;
 
   return new Response(html, {
