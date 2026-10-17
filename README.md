@@ -28,4 +28,9 @@ down, this page stays up.
 |---|---|---|
 | Platform | platform.pinfra.app/healthz | 5xx/timeout = outage; ≥1.5 s = degraded |
 | Website | pinfra.app/es | idem |
-| Published apps | gestion-de-comercio.pinfra.app | idem |
+| Published apps | gestion-de-comercio.pinfra.app | two requests: #1 measures the wake-up, #2 (immediate) the warm app. Outage = error/timeout/5xx on either. Degraded = warm ≥ 3 s, or the whole first visit ≥ 5 s. A normal wake-up is not degraded. |
+
+Wake detection: if the app sends `Server-Timing` (`wake;dur=<ms>`, `app;dur=<ms>`)
+it is authoritative (`wake` > 0 = it was asleep). Without it, a wake-up is
+inferred when request #1 is ≥ 1.2 s and ≥ 1.8× slower than request #2.
+Per-day wake counts and durations (median/max) are kept in the KV.
