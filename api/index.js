@@ -219,7 +219,8 @@ export default async function handler(request, context) {
   // The edge runtime cancels un-awaited promises once the Response is
   // returned — waitUntil keeps the history write alive past the response.
   // Falls back to fire-and-forget if the runtime doesn't provide context.
-  const historyWrite = recordHistory(results).catch(() => {});
+  // Preview deployments share the KV env vars: read history, never write it.
+  const historyWrite = process.env.VERCEL_ENV === 'preview' ? Promise.resolve() : recordHistory(results).catch(() => {});
   context?.waitUntil?.(historyWrite);
   const hist = await loadHistory();
 
