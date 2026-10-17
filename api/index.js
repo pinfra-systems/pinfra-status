@@ -3,16 +3,27 @@
 // (Vercel Marketplace KV) when configured, and renders the page.
 // Without KV env vars it still works: live checks only (fail-open).
 export const config = { runtime: 'edge' };
+import { parseServerTiming, mergeHops } from './_timing.js';
 
 const COMPONENTS = [
   { key: 'platform', name: 'Platform', desc: 'platform.pinfra.app — dashboard, publishing & API', url: 'https://platform.pinfra.app/healthz' },
   { key: 'website',  name: 'Website',  desc: 'pinfra.app — landing & guides',                    url: 'https://pinfra.app/es' },
   // Tenant apps are heavier SSR and may pay a scale-to-zero resume on the
   // first hit, so they get a wider degraded threshold than the platform.
-  { key: 'apps',     name: 'Published apps', desc: '*.pinfra.app — the apps our users ship. The first visit after 15 minutes without traffic wakes the app; that response is slower and is marked as degraded.', url: 'https://gestion-de-comercio.pinfra.app/', degradedMs: 3000 },
+  // wake: two-phase probe. Request 1 measures the wake-up (cold start), request 2,
+  // sent right after, measures the warm app. degradedMs applies to the warm
+  // request only; wakeDegradedMs bounds the whole first visit (edge -> app).
+  { key: 'apps',     name: 'Published apps', desc: '*.pinfra.app — the apps our users ship. They sleep after 15 minutes without traffic; the first visit wakes them, which is slower and is expected.', url: 'https://gestion-de-comercio.pinfra.app/', degradedMs: 3000, wake: true, wakeDegradedMs: 5000 },
 ];
 const DEGRADED_MS = 1500;
 const TIMEOUT_MS = 6000;
+const WAKE_TIMEOUT_MS = 8000;   // the first (possibly cold) request gets more room
+// Without a Server-Timing header, a wake-up is inferred when the first request
+// is clearly slower than the warm one: >= 1.2 s more AND >= 1.8x. A fresh TLS
+// handshake alone costs well under that.
+const INFER_MIN_DIFF_MS = 1200;
+const INFER_MIN_RATIO = 1.8;
+const WAKES_KEPT = 100;         // wake durations stored per day (median/max)
 const DAYS = 90;
 
 const KV_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '';
@@ -31,28 +42,64 @@ async function kv(cmd) {
   } catch { return null; }
 }
 
-async function probe(c) {
+// One timed request that follows redirects by hand, so a Server-Timing header
+// sent on any hop (the wake happens on the first one) is not lost.
+async function timed(url, timeoutMs) {
   const t0 = Date.now();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const hops = [];
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
-    const r = await fetch(c.url, { signal: ctrl.signal, redirect: 'follow', cache: 'no-store' });
-    clearTimeout(timer);
-    const ms = Date.now() - t0;
-    if (!r.ok && r.status >= 500) return { state: 'down', ms };
-    if (ms >= (c.degradedMs || DEGRADED_MS)) return { state: 'deg', ms };
-    return { state: 'ok', ms };
-  } catch { return { state: 'down', ms: Date.now() - t0 }; }
+    let cur = url;
+    for (let hop = 0; ; hop++) {
+      const r = await fetch(cur, { signal: ctrl.signal, redirect: 'manual', cache: 'no-store' });
+      hops.push(parseServerTiming(r.headers.get('server-timing')));
+      r.body?.cancel().catch(() => {});
+      const loc = r.headers.get('location');
+      if (r.status >= 300 && r.status < 400 && loc && hop < 4) { cur = new URL(loc, cur).href; continue; }
+      return { ms: Date.now() - t0, status: r.status, timing: mergeHops(hops) };
+    }
+  } catch { return { ms: Date.now() - t0, status: 0, timing: mergeHops(hops), err: true }; }
+  finally { clearTimeout(timer); }
+}
+
+const isDown = x => x.err || x.status >= 500;
+
+async function probe(c) {
+  if (!c.wake) {
+    const a = await timed(c.url, TIMEOUT_MS);
+    if (isDown(a)) return { state: 'down', ms: a.ms };
+    return { state: a.ms >= (c.degradedMs || DEGRADED_MS) ? 'deg' : 'ok', ms: a.ms };
+  }
+  // Two phases: cold-or-warm first request, then an immediate warm one.
+  const a = await timed(c.url, WAKE_TIMEOUT_MS);
+  if (isDown(a)) return { state: 'down', ms: a.ms, first: a.ms };
+  const b = await timed(c.url, TIMEOUT_MS);
+  if (isDown(b)) return { state: 'down', ms: b.ms, first: a.ms };
+  // Server-Timing is authoritative when present (even "no wake"); otherwise infer.
+  const hasHeader = 'wake' in a.timing || 'app' in a.timing;
+  const woke = hasHeader
+    ? (a.timing.wake || 0) > 0
+    : a.ms - b.ms >= INFER_MIN_DIFF_MS && a.ms >= INFER_MIN_RATIO * b.ms;
+  const slow = b.ms >= (c.degradedMs || DEGRADED_MS) || a.ms >= (c.wakeDegradedMs || 5000);
+  return {
+    state: slow ? 'deg' : 'ok',
+    ms: b.ms, first: a.ms, woke,
+    wakeMs: woke ? a.ms : null,
+    wakeServerMs: woke && hasHeader ? Math.round(a.timing.wake) : null,
+    src: hasHeader ? 'header' : 'inferred',
+  };
 }
 
 const WORSE = { ok: 0, deg: 1, down: 2 };
 function todayUTC() { return new Date().toISOString().slice(0, 10); }
 
-// A day is stored as {w: worst state, ok, deg, down: check counters}.
+// A day is stored as {w: worst state, ok, deg, down: check counters,
+// wk: wake-ups seen, wl: their durations in ms (last WAKES_KEPT)}.
 // Older days hold only the worst-state string; normalise both shapes.
 function dayEntry(v) {
-  if (v && typeof v === 'object') return { w: v.w || 'ok', ok: v.ok | 0, deg: v.deg | 0, down: v.down | 0 };
-  const e = { w: v || null, ok: 0, deg: 0, down: 0 };
+  if (v && typeof v === 'object') return { w: v.w || 'ok', ok: v.ok | 0, deg: v.deg | 0, down: v.down | 0, wk: v.wk | 0, wl: Array.isArray(v.wl) ? v.wl : [] };
+  const e = { w: v || null, ok: 0, deg: 0, down: 0, wk: 0, wl: [] };
   if (v) e[v] = 1;
   return e;
 }
@@ -68,6 +115,7 @@ async function recordHistory(results) {
     try { hist = raw ? JSON.parse(raw) : {}; } catch { hist = {}; }
     const e = dayEntry(hist[day]);
     e[r.state]++;
+    if (r.woke) { e.wk++; e.wl = [...e.wl, Math.round(r.wakeMs)].slice(-WAKES_KEPT); }
     if (!e.w || WORSE[r.state] > WORSE[e.w]) e.w = r.state;
     hist[day] = e;
     // keep only the window we render
@@ -104,6 +152,7 @@ function stripHTML(hist, live) {
     if (e && e.w && e.ok + e.deg + e.down > 0 && typeof hist[d] === 'object') {
       avail += e.ok + e.deg; total += n; countedDays++;
       tip += ` · ${e.ok + e.deg}/${n} checks available`;
+      if (e.wk && e.wl.length) tip += ` · ${e.wk} wake-up${e.wk > 1 ? 's' : ''} (median ${secs(median(e.wl))}, max ${secs(Math.max(...e.wl))})`;
     } else if (d === day && !hist[d]) {
       total++; if (live !== 'down') avail++; // live check not persisted yet
     } else if (s) {
@@ -117,6 +166,14 @@ function stripHTML(hist, live) {
   const uptime = total ? ((avail / total) * 100).toFixed(2).replace(/\.?0+$/, '') : null;
   return { cells: cells.join(''), uptime };
 }
+
+function median(a) {
+  if (!a.length) return null;
+  const x = [...a].sort((p, q) => p - q), m = x.length >> 1;
+  return x.length % 2 ? x[m] : Math.round((x[m - 1] + x[m]) / 2);
+}
+const fmt = n => Math.round(n).toLocaleString('en-US');
+const secs = n => (n / 1000).toFixed(1) + ' s';
 
 function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }
 
@@ -151,7 +208,8 @@ export default async function handler(request, context) {
   // The edge runtime cancels un-awaited promises once the Response is
   // returned — waitUntil keeps the history write alive past the response.
   // Falls back to fire-and-forget if the runtime doesn't provide context.
-  const historyWrite = recordHistory(results).catch(() => {});
+  // Preview deployments share the KV env vars: read history, never write it.
+  const historyWrite = process.env.VERCEL_ENV === 'preview' ? Promise.resolve() : recordHistory(results).catch(() => {});
   context?.waitUntil?.(historyWrite);
   const hist = await loadHistory();
 
@@ -160,10 +218,33 @@ export default async function handler(request, context) {
   const STATE_LABEL = { ok: 'Operational', deg: 'Degraded', down: 'Outage' };
   const STATE_COLOR = { ok: '#2fbf71', deg: '#f5c66b', down: '#f08a8a' };
 
+  const REGIONS = { gru1: 'São Paulo', iad1: 'Washington, D.C.', sfo1: 'San Francisco', pdx1: 'Portland', cle1: 'Cleveland', fra1: 'Frankfurt', cdg1: 'Paris', lhr1: 'London', dub1: 'Dublin', arn1: 'Stockholm', hnd1: 'Tokyo', kix1: 'Osaka', icn1: 'Seoul', sin1: 'Singapore', hkg1: 'Hong Kong', bom1: 'Mumbai', syd1: 'Sydney', cpt1: 'Cape Town' };
+  const regionCode = process.env.VERCEL_REGION || (request.headers.get('x-vercel-id') || '').split('::')[0];
+  const region = REGIONS[regionCode] || null;
+
+  // Wake-up figure: this check's if it woke the app, otherwise the median of
+  // the most recent day that saw wake-ups (the app was already awake now).
+  function wakeLine(c, r) {
+    let wakes = `<span class="dim">Wakes in — not seen yet</span>`, tip = 'No wake-up has been observed yet.';
+    if (r.woke) {
+      wakes = `Wakes in <b>${fmt(r.wakeMs)} ms</b>`;
+      tip = r.src === 'header' ? `Measured now. Server-side wake: ${fmt(r.wakeServerMs)} ms.` : 'Measured now (inferred: the first request was much slower than the second).';
+    } else {
+      const h = hist[c.key] || {};
+      const d = Object.keys(h).sort().reverse().find(k => dayEntry(h[k]).wl.length);
+      if (d) { wakes = `Wakes in <b>~${fmt(median(dayEntry(h[d]).wl))} ms</b>`; tip = `Median of the wake-ups seen on ${d}; the app was already awake on this check.`; }
+    }
+    const from = region ? `${region} to Helsinki` : `Vercel's edge to Helsinki`;
+    const rtt = regionCode === 'gru1' ? ' (that round trip alone costs about 1 s)' : '';
+    return `<div class="meta"><span>Responds in <b>${fmt(r.ms)} ms</b></span><span class="sep">·</span><span title="${esc(tip)}">${wakes}</span><span class="idle">first visit after 15 min without use</span></div>
+      <div class="net">Both include network time: this check runs from ${esc(from)}${rtt}. The app itself is faster.</div>`;
+  }
+
   const comps = results.map(({ c, r }) => {
     const { cells, uptime } = stripHTML(hist[c.key] || {}, r.state);
     return `<div class="comp">
-      <div class="crow"><span class="name">${c.name}</span><span class="q" title="${esc(c.desc)}">?</span><span class="lat">${r.ms} ms</span><span class="stat" style="color:${STATE_COLOR[r.state]}">${STATE_LABEL[r.state]}</span></div>
+      <div class="crow"><span class="name">${c.name}</span><span class="q" title="${esc(c.desc)}">?</span><span class="lat">${fmt(r.ms)} ms</span><span class="stat" style="color:${STATE_COLOR[r.state]}">${STATE_LABEL[r.state]}</span></div>
+      ${c.wake && r.state !== 'down' ? wakeLine(c, r) : ''}
       <div class="strip">${cells}</div>
       <div class="striplbl"><span class="l">90 days ago</span><hr><span>${uptime ? uptime + ' % uptime' : 'collecting data…'}</span><hr><span class="l">Today</span></div>
     </div>`;
@@ -191,9 +272,15 @@ body{background:var(--bg);color:var(--txt);font-family:'Inter',system-ui,sans-se
 .q{color:var(--dim);font-size:.72rem;border:1px solid var(--line);border-radius:50%;width:15px;height:15px;display:inline-flex;align-items:center;justify-content:center;cursor:help}
 .lat{margin-left:auto;font-family:var(--mono);font-size:.74rem;color:var(--dim)}
 .stat{font-size:.82rem;font-weight:600;margin-left:12px}
+.meta{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 8px;margin-top:8px;font-size:.78rem;color:var(--dim)}
+.meta b{color:var(--txt);font-weight:500;font-family:var(--mono);font-size:.76rem}
+.meta .sep{opacity:.5}.meta .dim{font-family:var(--mono);font-size:.76rem}
+.meta .idle{flex-basis:100%;font-size:.72rem}
+.net{margin-top:4px;font-size:.7rem;color:var(--dim);opacity:.8;line-height:1.5}
 .strip{display:flex;gap:2px;margin-top:12px;height:30px}
 .strip i{flex:1;border-radius:1.5px;background:var(--ok);min-width:2px}
 .strip i:hover{filter:brightness(1.25)}
+@media(max-width:520px){.strip{gap:1px}.strip i{min-width:1px}.comp{padding:15px 16px}.wrap{padding:28px 16px 48px}}
 .strip i.deg{background:var(--warn)}.strip i.down{background:var(--err)}.strip i.nodata{background:rgba(230,237,245,.09)}
 .striplbl{display:flex;align-items:center;gap:10px;color:var(--dim);font-size:.7rem;margin-top:8px;font-variant-numeric:tabular-nums}
 .striplbl .l{white-space:nowrap}.striplbl hr{flex:1;border:none;border-top:1px solid var(--line);margin:0}
@@ -222,7 +309,7 @@ h2{font-family:'Space Grotesk',sans-serif;font-size:1.15rem;font-weight:650;bord
   </div>
   <h2>Past incidents</h2>
   ${incidentsHTML()}
-  <div class="footer"><span>Probed live on every visit (cached 60&nbsp;s), from Vercel's edge — outside pinfra's own infrastructure. Uptime is the share of checks that were not an outage; slow responses show as degraded in the bars.</span><span class="out">If something is broken while this page reads green, tell us: soporte@pinfra.app</span></div>
+  <div class="footer"><span>Probed live on every visit (cached 60&nbsp;s), from Vercel's edge — outside pinfra's own infrastructure. Uptime is the share of checks that were not an outage; slow responses show as degraded in the bars. Published apps sleep after 15 minutes without traffic, so each check measures a possible wake-up and then the warm app; a normal wake-up is not degraded.</span><span class="out">If something is broken while this page reads green, tell us: soporte@pinfra.app</span></div>
 </div></body></html>`;
 
   return new Response(html, {
