@@ -230,7 +230,7 @@ export default async function handler(request, context) {
   const STATE_COLOR = { ok: '#2fbf71', deg: '#f5c66b', down: '#f08a8a' };
 
   const REGIONS = { gru1: 'São Paulo', iad1: 'Washington, D.C.', sfo1: 'San Francisco', pdx1: 'Portland', cle1: 'Cleveland', fra1: 'Frankfurt', cdg1: 'Paris', lhr1: 'London', dub1: 'Dublin', arn1: 'Stockholm', hnd1: 'Tokyo', kix1: 'Osaka', icn1: 'Seoul', sin1: 'Singapore', hkg1: 'Hong Kong', bom1: 'Mumbai', syd1: 'Sydney', cpt1: 'Cape Town' };
-  const regionCode = (request.headers.get('x-vercel-id') || '').split('::')[0];
+  const regionCode = process.env.VERCEL_REGION || (request.headers.get('x-vercel-id') || '').split('::')[0];
   const region = REGIONS[regionCode] || null;
 
   // Wake-up figure: this check's if it woke the app, otherwise the median of
